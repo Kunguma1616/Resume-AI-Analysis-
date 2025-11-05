@@ -7,3 +7,8 @@ python-dotenv>=1.0.1
 numpy>=1.26
 scipy>=1.11
 torch>=2.2 ; sys_platform != "darwin"
+
+# PDF stuff
+reportlab>=4,<5          # optional: will be used if present
+pillow>=10               # images support for reportlab/fpdf2
+fpdf2>=2.7               # pure-Python fallback when reportlab is missing
