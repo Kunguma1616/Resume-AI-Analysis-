@@ -9,6 +9,13 @@ from dotenv import load_dotenv, find_dotenv
 import os
 from pathlib import Path
 import base64
+import time
+from typing import List, Optional
+from pydantic import BaseModel, Field
+
+# LangChain imports for structured output
+from langchain_groq import ChatGroq
+from langchain_core.messages import SystemMessage, HumanMessage
 
 # ---------- PDF (ReportLab) ----------
 from reportlab.lib.pagesizes import A4
@@ -17,6 +24,24 @@ from reportlab.lib import colors
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Image, HRFlowable
 )
+
+# ============ STRUCTURED OUTPUT SCHEMA ============
+class CriterionScore(BaseModel):
+    """Individual criterion evaluation"""
+    criterion_name: str = Field(description="Name of the evaluation criterion")
+    score: float = Field(description="Score out of 5", ge=1.0, le=5.0)
+    explanation: str = Field(description="Detailed explanation for the score")
+
+class ResumeAnalysisOutput(BaseModel):
+    """Structured output schema for resume analysis"""
+    criteria_scores: List[CriterionScore] = Field(
+        description="List of 5-7 key criteria with scores and explanations"
+    )
+    pros: List[str] = Field(description="Strengths of the resume based on job description")
+    cons: List[str] = Field(description="Weaknesses or gaps in the resume")
+    overall_assessment: str = Field(description="Overall match assessment with improvement suggestions")
+    key_requirements_met: List[str] = Field(description="Key job requirements that are met")
+    key_requirements_missing: List[str] = Field(description="Key job requirements that are missing")
 
 # ============ ENV & MODEL ============
 load_dotenv(find_dotenv())
@@ -39,7 +64,7 @@ try:
     SCRIPT_DIR = Path(__file__).resolve().parent
 except NameError:
     SCRIPT_DIR = Path.cwd()
-LOGO_FILE = str(SCRIPT_DIR / "images.png")  # keep your logo here
+LOGO_FILE = str(SCRIPT_DIR / "images.png")
 
 # ============ CSS / THEME ============
 st.markdown("""
@@ -132,122 +157,131 @@ def calculate_similarity_bert(text1, text2):
     e1 = m.encode([text1]); e2 = m.encode([text2])
     return cosine_similarity(e1, e2)[0][0]
 
-# --------- Stable, TITLED sections parser (fixes score swing) ---------
-TITLED_SECTIONS = [
-    "1. Experience as a Qualified Electrician",
-    "2. Certifications (BS 7671, 2391)",
-    "3. Self-Employment / Apprenticeship Readiness",
-    "4. UK Manual Driving Licence",
-    "5. Availability (40 Hours/Week)",
-    "6. Knowledge of Regulations & Best Practices",
-    "7. Communication & Customer Service",
-]
-
-def split_markdown_sections(md: str):
-    sections = {}
-    current_title = None
-    buf = []
-    for line in md.splitlines():
-        if line.strip().startswith("## "):
-            if current_title is not None:
-                sections[current_title] = "\n".join(buf).strip()
-            current_title = line.strip().replace("##", "", 1).strip()
-            buf = []
-        else:
-            buf.append(line)
-    if current_title is not None:
-        sections[current_title] = "\n".join(buf).strip()
-    return sections
-
-def extract_first_score(text):
-    m = re.search(r'(\d+(?:\.\d+)?)/5', text)
-    return float(m.group(1)) if m else None
-
-def compute_ai_eval_from_titled_sections(report_md: str):
-    sections = split_markdown_sections(report_md)
-    scores = []
-    for title in TITLED_SECTIONS:
-        matched_key = next((k for k in sections.keys() if k.lower().startswith(title.lower())), None)
-        if matched_key:
-            s = extract_first_score(sections[matched_key])
-            if s is not None:
-                scores.append(s)
-    if not scores:
-        return 0.0
-    avg_5pt = sum(scores) / len(scores)
-    return avg_5pt / 5.0
-
-# ============ AI PROMPT ============
-def get_report(resume, job_desc):
+# ============ STRUCTURED AI ANALYSIS ============
+def get_structured_report(resume: str, job_desc: str) -> ResumeAnalysisOutput:
+    """
+    Use LangChain with structured output to get consistent, parseable analysis
+    """
     if not api_key:
         st.error("API Key not loaded. Cannot generate report.")
-        return "Error: API Key not found."
+        raise ValueError("API Key not found.")
 
-    # Enforce EXACT titled sections; start with "N/5" but NO emojis (keeps PDF clean)
-    prompt = f"""
-You are an expert AI Resume Analyzer.
+    system_prompt = """You are an expert AI Resume Analyzer specializing in matching candidates to job requirements.
 
-Return the result in MARKDOWN with EXACTLY these sections (start each section title with '## '):
+Your task is to analyze the resume against the job description and provide a structured evaluation.
 
-## 1. Experience as a Qualified Electrician
-- Begin with a score like "4/5" then a short paragraph.
+CRITICAL INSTRUCTIONS:
+1. Dynamically identify 5-7 KEY CRITERIA that are most relevant to THIS specific job description
+2. DO NOT use generic criteria - analyze what THIS job actually requires
+3. For each criterion, provide:
+   - A clear, specific criterion name
+   - A score from 1.0 to 5.0 (you can use decimals like 3.5)
+   - A detailed explanation with evidence from the resume
+4. Be objective, evidence-based, and constructive
+5. Focus on job requirements like: relevant experience, required skills, certifications, education, location match, availability, soft skills, etc.
 
-## 2. Certifications (BS 7671, 2391)
-- Score "N/5" + explanation.
+Provide comprehensive pros and cons lists, and an overall assessment with actionable improvement suggestions."""
 
-## 3. Self-Employment / Apprenticeship Readiness
-- Score "N/5" + explanation.
-
-## 4. UK Manual Driving Licence
-- Score "N/5" + explanation.
-
-## 5. Availability (40 Hours/Week)
-- Score "N/5" + explanation.
-
-## 6. Knowledge of Regulations & Best Practices
-- Score "N/5" + explanation.
-
-## 7. Communication & Customer Service
-- Score "N/5" + explanation.
-
-## Pros of the Resume (Based on Job Description)
-- Bullet list of strengths.
-
-## Cons of the Resume (Based on Job Description)
-- Bullet list of gaps.
-
-## Why this is Good/Bad
-- One concise paragraph with improvements.
-
-Return only markdown content.
-
-Resume:
-```{resume}```
-
-Job Description:
-```{job_desc}```
-"""
     try:
-        client = Groq(api_key=api_key)
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
+        # Initialize ChatGroq with LangChain
+        llm = ChatGroq(
+            api_key=api_key,
             model=MODEL_ID,
-            temperature=0.0,
+            temperature=0.2
         )
-        return chat_completion.choices[0].message.content
+        
+        # Bind structured output schema to the model - LangChain's way
+        structured_llm = llm.with_structured_output(
+            ResumeAnalysisOutput,
+            method="function_calling",  # Uses Groq's tool-calling API
+            include_raw=False
+        )
+        
+        # Create messages using LangChain message types
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(
+                content=f"""Analyze the following resume against the job description:
+
+JOB DESCRIPTION:
+{job_desc}
+
+RESUME:
+{resume}
+
+Provide a comprehensive structured analysis."""
+            )
+        ]
+        
+        # Invoke the model - LangChain's invoke() method
+        st.info("🔄 Sending resume to AI for structured analysis...")
+        start_time = time.time()
+        analysis = structured_llm.invoke(messages)
+        duration = time.time() - start_time
+        st.success(f"✅ Analysis completed in {duration:.2f} seconds")
+        
+        return analysis
+        
     except Exception as e:
-        st.error("AI model error:")
-        st.error(e)
-        return "Failed to generate report due to an API error."
+        st.error(f"AI model error: {str(e)}")
+        raise
+
+def compute_ai_score_from_structured(analysis: ResumeAnalysisOutput) -> float:
+    """Calculate average score from structured output"""
+    if not analysis.criteria_scores:
+        return 0.0
+    
+    total = sum(criterion.score for criterion in analysis.criteria_scores)
+    avg_5pt = total / len(analysis.criteria_scores)
+    return avg_5pt / 5.0
+
+def convert_structured_to_markdown(analysis: ResumeAnalysisOutput) -> str:
+    """Convert structured output to markdown for display and PDF"""
+    md_parts = []
+    
+    # Criteria sections
+    for criterion in analysis.criteria_scores:
+        md_parts.append(f"## {criterion.criterion_name}")
+        md_parts.append(f"**Score: {criterion.score}/5**\n")
+        md_parts.append(f"{criterion.explanation}\n")
+    
+    # Pros
+    md_parts.append("## Pros of the Resume (Based on Job Description)")
+    for pro in analysis.pros:
+        md_parts.append(f"- {pro}")
+    md_parts.append("")
+    
+    # Cons
+    md_parts.append("## Cons of the Resume (Based on Job Description)")
+    for con in analysis.cons:
+        md_parts.append(f"- {con}")
+    md_parts.append("")
+    
+    # Overall assessment
+    md_parts.append("## Overall Match Assessment")
+    md_parts.append(analysis.overall_assessment)
+    md_parts.append("")
+    
+    # Requirements met
+    if analysis.key_requirements_met:
+        md_parts.append("## Key Requirements Met")
+        for req in analysis.key_requirements_met:
+            md_parts.append(f"- {req}")
+        md_parts.append("")
+    
+    # Requirements missing
+    if analysis.key_requirements_missing:
+        md_parts.append("## Key Requirements Missing")
+        for req in analysis.key_requirements_missing:
+            md_parts.append(f"- {req}")
+        md_parts.append("")
+    
+    return "\n".join(md_parts)
 
 # ============ PDF BUILDER ============
 def build_pdf_bytes(*, logo_path: str | None, candidate_name: str, ats_score: float, ai_score: float, report_markdown: str) -> bytes:
     """
-    Clean, single-column PDF:
-    - Logo, title, candidate name
-    - One-line 'What These Scores Mean'
-    - ATS & AI KPI values
-    - Titled sections rendered as paragraphs (no bullets/boxes/emojis)
+    Clean, single-column PDF with dynamic sections
     """
     from io import BytesIO
     buff = BytesIO()
@@ -276,19 +310,16 @@ def build_pdf_bytes(*, logo_path: str | None, candidate_name: str, ats_score: fl
     story.append(Paragraph(f"Candidate: <b>{candidate_name or '—'}</b>", candidate_style))
     story.append(Spacer(1, 8))
 
-    # ONE-LINE explanation only (per your request)
     story.append(Paragraph("Understanding the Scores", section))
     story.append(Paragraph("Each criterion below is rated from 1 to 5 based on job fit and supporting evidence.", body))
     story.append(Spacer(1, 8))
 
-    # KPIs
     story.append(Paragraph(f"ATS Similarity Score: <b>{ats_score*100:.1f}%</b>", kpi))
     story.append(Paragraph(f"AI Evaluation Score: <b>{ai_score*100:.1f}%</b>", kpi))
     story.append(Spacer(1, 8))
     story.append(HRFlowable(color=colors.HexColor("#D5D8DC"), thickness=1))
     story.append(Spacer(1, 8))
 
-    # Render titled sections: headers + paragraphs ONLY (no bullets)
     for raw in report_markdown.splitlines():
         line = raw.strip()
         if not line:
@@ -297,7 +328,6 @@ def build_pdf_bytes(*, logo_path: str | None, candidate_name: str, ats_score: fl
             story.append(Spacer(1, 6))
             story.append(Paragraph(line.replace("##", "").strip(), section))
             continue
-        # Convert bullet lines to plain paragraphs (remove symbols)
         if line.startswith(("-", "*", "•")):
             line = line.lstrip("-*• ").strip()
         story.append(Paragraph(line, body))
@@ -347,7 +377,7 @@ if not api_key:
 if not st.session_state.form_submitted:
     with st.form("my_form"):
         st.markdown("### 👤 Candidate Name (for report header)")
-        name_input = st.text_input("Full name", placeholder="e.g., Numan Ermis")
+        name_input = st.text_input("Full name", placeholder="e.g., John Smith")
 
         st.markdown("### 📄 Upload Candidate Resume")
         resume_file = st.file_uploader(label="Upload Resume/CV (PDF)", type="pdf")
@@ -372,10 +402,18 @@ if not st.session_state.form_submitted:
             else:
                 st.warning("⚠️ Please upload a resume and provide a job description.")
 else:
-    with st.spinner("⚡ Generating AI analysis..."):
+    with st.spinner("⚡ Generating structured AI analysis..."):
+        # Calculate ATS score
         ats_score = calculate_similarity_bert(st.session_state.resume, st.session_state.job_desc)
-        report_md = get_report(st.session_state.resume, st.session_state.job_desc)
-        avg_score = compute_ai_eval_from_titled_sections(report_md)  # stable
+        
+        # Get structured analysis from AI
+        try:
+            structured_analysis = get_structured_report(st.session_state.resume, st.session_state.job_desc)
+            ai_score = compute_ai_score_from_structured(structured_analysis)
+            report_md = convert_structured_to_markdown(structured_analysis)
+        except Exception as e:
+            st.error(f"Failed to generate analysis: {str(e)}")
+            st.stop()
 
     # KPI cards
     st.markdown('<div class="score-container">', unsafe_allow_html=True)
@@ -390,29 +428,28 @@ else:
     with c2:
         st.markdown(
             f'<div class="score-card"><h3>🎯 AI Evaluation Score</h3>'
-            f'<h2>{avg_score:.1%}</h2>'
-            f'<p style="margin-top: 1rem; opacity: 0.9;">Average across titled criteria</p></div>',
+            f'<h2>{ai_score:.1%}</h2>'
+            f'<p style="margin-top: 1rem; opacity: 0.9;">Average across evaluation criteria</p></div>',
             unsafe_allow_html=True,
         )
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # What These Scores Mean (ONE LINE ONLY)
     st.markdown("### 📌 What These Scores Mean")
-    st.markdown("Each criterion below is rated from **1 to 5** based on job fit and supporting evidence.")
+    st.markdown("Each criterion below is rated from **1 to 5** based on job fit and supporting evidence from the resume.")
 
-    # Full titled report
+    # Full report
     st.markdown('<div class="report-container">', unsafe_allow_html=True)
     st.markdown(f"## Candidate: **{st.session_state.candidate_name or '—'}**")
-    st.markdown("## AI Generated Analysis Report (Titled Sections)")
+    st.markdown("## AI Generated Analysis Report")
     st.markdown(report_md, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # PDF download (clean, branded, no bullets/boxes)
+    # PDF download
     pdf_bytes = build_pdf_bytes(
         logo_path=LOGO_FILE if Path(LOGO_FILE).exists() else None,
         candidate_name=st.session_state.candidate_name or "—",
         ats_score=ats_score,
-        ai_score=avg_score,
+        ai_score=ai_score,
         report_markdown=report_md
     )
     st.download_button(
@@ -423,7 +460,7 @@ else:
         use_container_width=True
     )
 
-    if st.button("🔙 Analyze Another", use_container_width=True, type="primary"):
+    if st.button(" Analyze Another", use_container_width=True, type="primary"):
         st.session_state.form_submitted = False
         st.session_state.resume = ""
         st.session_state.job_desc = ""
