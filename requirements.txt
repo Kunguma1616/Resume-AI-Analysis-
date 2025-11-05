@@ -12,3 +12,5 @@ torch>=2.2 ; sys_platform != "darwin"
 reportlab>=4,<5          # optional: will be used if present
 pillow>=10               # images support for reportlab/fpdf2
 fpdf2>=2.7               # pure-Python fallback when reportlab is missing
+langchain
+langchain-groq
